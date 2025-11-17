@@ -1,0 +1,254 @@
+// Prisma schema for LibreCrawl
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// User authentication and authorization
+model User {
+  id            String   @id @default(uuid())
+  email         String   @unique
+  username      String   @unique
+  passwordHash  String
+  tier          UserTier @default(GUEST)
+  isActive      Boolean  @default(true)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+  lastLoginAt   DateTime?
+
+  // Relations
+  crawls        Crawl[]
+  settings      UserSettings?
+
+  @@index([email])
+  @@index([username])
+}
+
+enum UserTier {
+  GUEST
+  USER
+  EXTRA
+  ADMIN
+}
+
+// User-specific settings
+model UserSettings {
+  id              String   @id @default(uuid())
+  userId          String   @unique
+  user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Crawl defaults
+  defaultDelay    Int      @default(1000)
+  defaultDepth    Int      @default(3)
+  followExternal  Boolean  @default(false)
+  jsRendering     Boolean  @default(false)
+
+  // UI preferences
+  theme           String   @default("light")
+  customCss       String?
+
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+}
+
+// Crawl sessions
+model Crawl {
+  id              String       @id @default(uuid())
+  userId          String?
+  user            User?        @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  // Crawl configuration
+  startUrl        String
+  maxDepth        Int          @default(3)
+  delay           Int          @default(1000)
+  followExternal  Boolean      @default(false)
+  jsRendering     Boolean      @default(false)
+  maxUrls         Int          @default(10000)
+
+  // Crawl status
+  status          CrawlStatus  @default(PENDING)
+  progress        Float        @default(0)
+  urlsCrawled     Int          @default(0)
+  totalUrls       Int          @default(0)
+
+  // Timestamps
+  startedAt       DateTime?
+  completedAt     DateTime?
+  createdAt       DateTime     @default(now())
+  updatedAt       DateTime     @updatedAt
+
+  // Relations
+  pages           Page[]
+  links           Link[]
+  issues          Issue[]
+
+  @@index([userId])
+  @@index([status])
+  @@index([createdAt])
+}
+
+enum CrawlStatus {
+  PENDING
+  RUNNING
+  COMPLETED
+  FAILED
+  CANCELLED
+}
+
+// Crawled pages with SEO data
+model Page {
+  id              String   @id @default(uuid())
+  crawlId         String
+  crawl           Crawl    @relation(fields: [crawlId], references: [id], onDelete: Cascade)
+
+  // Page info
+  url             String
+  statusCode      Int?
+  contentType     String?
+  depth           Int      @default(0)
+
+  // SEO data
+  title           String?
+  metaDescription String?
+  h1              String[]
+  h2              String[]
+  h3              String[]
+  canonicalUrl    String?
+
+  // Open Graph
+  ogTitle         String?
+  ogDescription   String?
+  ogImage         String?
+  ogType          String?
+
+  // Twitter Card
+  twitterCard     String?
+  twitterTitle    String?
+  twitterDescription String?
+  twitterImage    String?
+
+  // Analytics
+  hasAnalytics    Boolean  @default(false)
+  analyticsTools  String[] // GA4, GTM, etc.
+
+  // Content metrics
+  wordCount       Int      @default(0)
+  imageCount      Int      @default(0)
+  imagesWithAlt   Int      @default(0)
+  internalLinks   Int      @default(0)
+  externalLinks   Int      @default(0)
+
+  // Performance (optional)
+  loadTime        Float?
+  lcp             Float?
+  fid             Float?
+  cls             Float?
+
+  // Structured data
+  structuredData  Json?
+
+  crawledAt       DateTime @default(now())
+
+  // Relations
+  outgoingLinks   Link[]   @relation("SourcePage")
+  incomingLinks   Link[]   @relation("TargetPage")
+  issues          Issue[]
+
+  @@index([crawlId])
+  @@index([url])
+  @@index([statusCode])
+}
+
+// Link relationships between pages
+model Link {
+  id              String   @id @default(uuid())
+  crawlId         String
+  crawl           Crawl    @relation(fields: [crawlId], references: [id], onDelete: Cascade)
+
+  sourcePageId    String
+  sourcePage      Page     @relation("SourcePage", fields: [sourcePageId], references: [id], onDelete: Cascade)
+
+  targetPageId    String?
+  targetPage      Page?    @relation("TargetPage", fields: [targetPageId], references: [id], onDelete: Cascade)
+
+  targetUrl       String
+  anchorText      String?
+  rel             String?
+  isExternal      Boolean  @default(false)
+  isNoFollow      Boolean  @default(false)
+
+  createdAt       DateTime @default(now())
+
+  @@index([crawlId])
+  @@index([sourcePageId])
+  @@index([targetPageId])
+  @@index([isExternal])
+}
+
+// SEO issues detected
+model Issue {
+  id              String       @id @default(uuid())
+  crawlId         String
+  crawl           Crawl        @relation(fields: [crawlId], references: [id], onDelete: Cascade)
+
+  pageId          String?
+  page            Page?        @relation(fields: [pageId], references: [id], onDelete: Cascade)
+
+  type            IssueType
+  severity        IssueSeverity
+  title           String
+  description     String
+  recommendation  String?
+
+  createdAt       DateTime     @default(now())
+
+  @@index([crawlId])
+  @@index([pageId])
+  @@index([type])
+  @@index([severity])
+}
+
+enum IssueType {
+  MISSING_TITLE
+  DUPLICATE_TITLE
+  TITLE_TOO_LONG
+  TITLE_TOO_SHORT
+  MISSING_META_DESCRIPTION
+  META_DESCRIPTION_TOO_LONG
+  META_DESCRIPTION_TOO_SHORT
+  MISSING_H1
+  MULTIPLE_H1
+  MISSING_ALT_TEXT
+  BROKEN_LINK
+  SLOW_PAGE
+  POOR_CORE_WEB_VITALS
+  MISSING_CANONICAL
+  MISSING_OG_TAGS
+  THIN_CONTENT
+  NO_INDEX
+  REDIRECT_CHAIN
+  HTTP_ERROR
+}
+
+enum IssueSeverity {
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+}
+
+// Crawl history for rate limiting (guest users)
+model CrawlHistory {
+  id              String   @id @default(uuid())
+  ipAddress       String
+  userAgent       String?
+  crawlId         String
+  createdAt       DateTime @default(now())
+
+  @@index([ipAddress, createdAt])
+}
