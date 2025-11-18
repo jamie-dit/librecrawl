@@ -257,7 +257,14 @@ function stopPythonCrawl() {
 function pollCrawlProgress() {
     if (!crawlState.isRunning) return;
 
-    fetch('/api/crawl_status')
+    // Build incremental update URL with last received indexes
+    const lastUrlIndex = crawlState.lastUrlIndex || 0;
+    const lastLinkIndex = crawlState.lastLinkIndex || 0;
+    const lastIssueIndex = crawlState.lastIssueIndex || 0;
+
+    const url = `/api/crawl_status?last_url_index=${lastUrlIndex}&last_link_index=${lastLinkIndex}&last_issue_index=${lastIssueIndex}`;
+
+    fetch(url)
         .then(response => response.json())
         .then(data => {
             updateCrawlData(data);
@@ -276,7 +283,7 @@ function pollCrawlProgress() {
             }
 
             if (crawlState.isRunning && data.status !== 'completed') {
-                setTimeout(pollCrawlProgress, 1000); // Poll every second
+                setTimeout(pollCrawlProgress, 3000); // Poll every 3 seconds (improved from 1s)
             } else if (data.status === 'completed') {
                 stopCrawl();
                 updateStatus('Crawl completed');
@@ -301,34 +308,70 @@ function updateCrawlData(data) {
         updateMemoryDisplay(data.memory, data.memory_data);
     }
 
-    // Update tables with new URLs
-    if (data.urls) {
+    // Handle incremental vs full updates
+    const isIncremental = data.incremental || false;
+    const totalCounts = data.total_counts || {};
+
+    // Update tables with new URLs (incremental data)
+    if (data.urls && data.urls.length > 0) {
         data.urls.forEach(url => {
             addUrlToTable(url);
         });
+        // Update last URL index for next incremental request
+        if (totalCounts.urls !== undefined) {
+            crawlState.lastUrlIndex = totalCounts.urls;
+        }
     }
 
     // Update links tables only if Links tab is active to improve performance
     if (data.links) {
-        // Always store links data in crawlState
-        crawlState.links = data.links;
+        if (isIncremental) {
+            // Merge incremental links data
+            crawlState.links = (crawlState.links || []).concat(data.links);
+        } else {
+            // Full update - replace all
+            crawlState.links = data.links;
+        }
+
         if (isLinksTabActive()) {
-            updateLinksTable(data.links);
+            // For incremental, only update if there are new links
+            if (data.links.length > 0) {
+                updateLinksTable(crawlState.links);
+            }
         } else {
             // Store in pendingLinks for lazy loading when switching to tab
-            crawlState.pendingLinks = data.links;
+            crawlState.pendingLinks = crawlState.links;
+        }
+
+        // Update last link index
+        if (totalCounts.links !== undefined) {
+            crawlState.lastLinkIndex = totalCounts.links;
         }
     }
 
     // Update issues table only if Issues tab is active
     if (data.issues) {
-        // Always store issues data in crawlState
-        crawlState.issues = data.issues;
+        if (isIncremental) {
+            // Merge incremental issues data
+            crawlState.issues = (crawlState.issues || []).concat(data.issues);
+        } else {
+            // Full update - replace all
+            crawlState.issues = data.issues;
+        }
+
         if (isIssuesTabActive()) {
-            updateIssuesTable(data.issues);
+            // For incremental, only update if there are new issues
+            if (data.issues.length > 0) {
+                updateIssuesTable(crawlState.issues);
+            }
         } else {
             // Store in pendingIssues for lazy loading when switching to tab
-            crawlState.pendingIssues = data.issues;
+            crawlState.pendingIssues = crawlState.issues;
+        }
+
+        // Update last issue index
+        if (totalCounts.issues !== undefined) {
+            crawlState.lastIssueIndex = totalCounts.issues;
         }
     }
 

@@ -5,17 +5,64 @@ Handles user registration, login, and verification
 import sqlite3
 import bcrypt
 import os
+import threading
 from datetime import datetime
 from contextlib import contextmanager
+from queue import Queue, Empty
+from functools import lru_cache
+import json
 
 # Database file location
 DB_FILE = 'users.db'
 
+# Connection pool for better performance
+class ConnectionPool:
+    """Simple SQLite connection pool to reduce connection overhead"""
+    def __init__(self, db_file, pool_size=5):
+        self.db_file = db_file
+        self.pool_size = pool_size
+        self.pool = Queue(maxsize=pool_size)
+        self.lock = threading.Lock()
+        self.total_connections = 0
+
+    def get_connection(self):
+        """Get a connection from the pool or create a new one"""
+        try:
+            # Try to get from pool without blocking
+            conn = self.pool.get_nowait()
+            return conn
+        except Empty:
+            # Pool empty, create new connection if under limit
+            with self.lock:
+                if self.total_connections < self.pool_size:
+                    conn = sqlite3.connect(self.db_file, check_same_thread=False)
+                    conn.row_factory = sqlite3.Row
+                    self.total_connections += 1
+                    return conn
+            # Wait for available connection
+            return self.pool.get()
+
+    def return_connection(self, conn):
+        """Return a connection to the pool"""
+        try:
+            self.pool.put_nowait(conn)
+        except:
+            # Pool full, close the connection
+            conn.close()
+            with self.lock:
+                self.total_connections -= 1
+
+# Global connection pool
+_connection_pool = ConnectionPool(DB_FILE, pool_size=10)
+
+# In-memory settings cache to reduce DB queries
+_settings_cache = {}  # user_id -> (settings_dict, timestamp)
+_settings_cache_lock = threading.Lock()
+
 @contextmanager
 def get_db():
-    """Context manager for database connections"""
-    conn = sqlite3.connect(DB_FILE)
-    conn.row_factory = sqlite3.Row  # Return rows as dictionaries
+    """Context manager for database connections using connection pool"""
+    conn = _connection_pool.get_connection()
     try:
         yield conn
         conn.commit()
@@ -23,7 +70,7 @@ def get_db():
         conn.rollback()
         raise e
     finally:
-        conn.close()
+        _connection_pool.return_connection(conn)
 
 def init_db():
     """Initialize the database with users and settings tables"""
@@ -71,6 +118,20 @@ def init_db():
         cursor.execute('''
             CREATE INDEX IF NOT EXISTS idx_guest_ip_time
             ON guest_crawls(ip_address, crawl_time)
+        ''')
+
+        # Add performance indexes for faster queries
+        cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_users_username
+            ON users(username)
+        ''')
+        cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_users_email
+            ON users(email)
+        ''')
+        cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_crawl_history_user_id
+            ON crawl_history(user_id, started_at)
         ''')
 
         # Add tier column to existing users table if it doesn't exist
@@ -232,7 +293,6 @@ def verify_user(user_id):
 
 def save_user_settings(user_id, settings_dict):
     """Save settings for a user (stores as JSON)"""
-    import json
     try:
         settings_json = json.dumps(settings_dict)
         with get_db() as conn:
@@ -244,14 +304,28 @@ def save_user_settings(user_id, settings_dict):
                     settings_json = excluded.settings_json,
                     updated_at = CURRENT_TIMESTAMP
             ''', (user_id, settings_json))
+
+        # Invalidate cache after save
+        with _settings_cache_lock:
+            if user_id in _settings_cache:
+                del _settings_cache[user_id]
+
         return True, "Settings saved successfully"
     except Exception as e:
         print(f"Error saving user settings: {e}")
         return False, f"Failed to save settings: {str(e)}"
 
 def get_user_settings(user_id):
-    """Get settings for a user (returns dict or None)"""
-    import json
+    """Get settings for a user with in-memory caching (returns dict or None)"""
+    # Check cache first
+    with _settings_cache_lock:
+        if user_id in _settings_cache:
+            cached_settings, cached_time = _settings_cache[user_id]
+            # Cache valid for 5 minutes
+            if (datetime.now() - cached_time).total_seconds() < 300:
+                return cached_settings.copy()  # Return copy to prevent external modification
+
+    # Cache miss or expired - load from DB
     try:
         with get_db() as conn:
             cursor = conn.cursor()
@@ -263,7 +337,11 @@ def get_user_settings(user_id):
 
             result = cursor.fetchone()
             if result:
-                return json.loads(result['settings_json'])
+                settings = json.loads(result['settings_json'])
+                # Update cache
+                with _settings_cache_lock:
+                    _settings_cache[user_id] = (settings, datetime.now())
+                return settings
             return None
     except Exception as e:
         print(f"Error fetching user settings: {e}")
@@ -275,6 +353,12 @@ def delete_user_settings(user_id):
         with get_db() as conn:
             cursor = conn.cursor()
             cursor.execute('DELETE FROM user_settings WHERE user_id = ?', (user_id,))
+
+        # Invalidate cache after delete
+        with _settings_cache_lock:
+            if user_id in _settings_cache:
+                del _settings_cache[user_id]
+
         return True
     except Exception as e:
         print(f"Error deleting user settings: {e}")

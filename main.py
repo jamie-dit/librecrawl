@@ -61,8 +61,8 @@ def login_required(f):
     return decorated_function
 
 # Multi-tenant crawler instances
-crawler_instances = {}  # session_id -> {'crawler': WebCrawler, 'settings': SettingsManager, 'last_accessed': datetime}
-instances_lock = threading.Lock()
+crawler_instances = {}  # session_id -> {'crawler': WebCrawler, 'settings': SettingsManager, 'last_accessed': datetime, 'lock': threading.Lock()}
+instances_lock = threading.Lock()  # Only for creating/removing sessions
 
 def get_or_create_crawler():
     """Get or create a crawler instance for the current session"""
@@ -74,17 +74,25 @@ def get_or_create_crawler():
     user_id = session.get('user_id')  # Get user_id from session
     tier = session.get('tier', 'guest')  # Get tier from session
 
+    # Fast path: check if session exists without lock
+    if session_id in crawler_instances:
+        instance = crawler_instances[session_id]
+        with instance['lock']:
+            instance['last_accessed'] = datetime.now()
+            return instance['crawler']
+
+    # Slow path: create new session with global lock
     with instances_lock:
-        # Check if crawler exists for this session
+        # Double-check pattern
         if session_id not in crawler_instances:
             print(f"Creating new crawler instance for session: {session_id}, user: {user_id}, tier: {tier}")
             crawler_instances[session_id] = {
                 'crawler': WebCrawler(),
                 'settings': SettingsManager(session_id=session_id, user_id=user_id, tier=tier),  # Per-user settings
-                'last_accessed': datetime.now()
+                'last_accessed': datetime.now(),
+                'lock': threading.Lock()  # Per-session lock
             }
         else:
-            # Update last accessed time
             crawler_instances[session_id]['last_accessed'] = datetime.now()
 
         return crawler_instances[session_id]['crawler']
@@ -99,17 +107,25 @@ def get_session_settings():
     user_id = session.get('user_id')  # Get user_id from session
     tier = session.get('tier', 'guest')  # Get tier from session
 
+    # Fast path: check if session exists without lock
+    if session_id in crawler_instances:
+        instance = crawler_instances[session_id]
+        with instance['lock']:
+            instance['last_accessed'] = datetime.now()
+            return instance['settings']
+
+    # Slow path: create new session with global lock
     with instances_lock:
-        # Create instance if it doesn't exist
+        # Double-check pattern
         if session_id not in crawler_instances:
             print(f"Creating new settings instance for session: {session_id}, user: {user_id}, tier: {tier}")
             crawler_instances[session_id] = {
                 'crawler': WebCrawler(),
                 'settings': SettingsManager(session_id=session_id, user_id=user_id, tier=tier),
-                'last_accessed': datetime.now()
+                'last_accessed': datetime.now(),
+                'lock': threading.Lock()  # Per-session lock
             }
         else:
-            # Update last accessed time
             crawler_instances[session_id]['last_accessed'] = datetime.now()
 
         return crawler_instances[session_id]['settings']
@@ -515,7 +531,19 @@ def stop_crawl():
 def crawl_status():
     crawler = get_or_create_crawler()
     settings_manager = get_session_settings()
-    status_data = crawler.get_status()
+
+    # Get incremental update parameters from query string
+    last_url_index = int(request.args.get('last_url_index', 0))
+    last_link_index = int(request.args.get('last_link_index', 0))
+    last_issue_index = int(request.args.get('last_issue_index', 0))
+    full = request.args.get('full', 'false').lower() == 'true'
+
+    status_data = crawler.get_status(
+        last_url_index=last_url_index,
+        last_link_index=last_link_index,
+        last_issue_index=last_issue_index,
+        full=full
+    )
 
     # Apply current issue exclusion patterns to displayed issues
     issues = status_data.get('issues', [])

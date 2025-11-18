@@ -315,8 +315,16 @@ class WebCrawler:
         self.is_paused = False
         return True, "Crawl resumed"
 
-    def get_status(self):
-        """Get current crawl status and results"""
+    def get_status(self, last_url_index=0, last_link_index=0, last_issue_index=0, full=False):
+        """
+        Get current crawl status and results with incremental updates support
+
+        Args:
+            last_url_index: Index of last URL received by client
+            last_link_index: Index of last link received by client
+            last_issue_index: Index of last issue received by client
+            full: If True, return all data (ignore indexes)
+        """
         status = 'completed' if not self.is_running and self.stats['crawled'] > 0 else 'running'
         if not self.is_running and self.stats['crawled'] == 0:
             status = 'idle'
@@ -338,13 +346,44 @@ class WebCrawler:
 
         # Get actual data size for accurate estimates
         from src.core.memory_profiler import MemoryProfiler
-        data_sizes = MemoryProfiler.get_crawler_data_size(
-            self.crawl_results,
-            self.link_manager.all_links if self.link_manager else [],
-            self.issue_detector.detected_issues if self.issue_detector else []
-        )
 
-        print(f"get_status called - crawl_results length: {len(self.crawl_results)}, status: {status}, crawled: {self.stats['crawled']}")
+        # Get data incrementally to reduce memory and bandwidth
+        if full or last_url_index == 0:
+            # Full data requested or first request
+            urls_data = self.crawl_results.copy()
+            new_url_count = len(urls_data)
+        else:
+            # Incremental update - only new URLs
+            urls_data = self.crawl_results[last_url_index:]
+            new_url_count = len(urls_data)
+
+        if full or last_link_index == 0:
+            links_data = self.link_manager.all_links.copy() if self.link_manager else []
+            new_link_count = len(links_data)
+        else:
+            links_data = self.link_manager.all_links[last_link_index:] if self.link_manager else []
+            new_link_count = len(links_data)
+
+        all_issues = self.issue_detector.get_issues() if self.issue_detector else []
+        if full or last_issue_index == 0:
+            issues_data = all_issues
+            new_issue_count = len(issues_data)
+        else:
+            issues_data = all_issues[last_issue_index:]
+            new_issue_count = len(issues_data)
+
+        # Calculate data sizes only when needed (full status or first request)
+        if full or last_url_index == 0:
+            data_sizes = MemoryProfiler.get_crawler_data_size(
+                self.crawl_results,
+                self.link_manager.all_links if self.link_manager else [],
+                all_issues
+            )
+        else:
+            # Skip expensive memory calculation on incremental updates
+            data_sizes = {'total_mb': 0, 'urls_mb': 0, 'links_mb': 0, 'issues_mb': 0}
+
+        print(f"get_status called - urls: {new_url_count} new (total: {len(self.crawl_results)}), links: {new_link_count} new, issues: {new_issue_count} new")
 
         return {
             'status': status,
@@ -352,9 +391,15 @@ class WebCrawler:
                 **self.stats,
                 'discovered': link_stats['discovered']
             },
-            'urls': self.crawl_results.copy(),
-            'links': self.link_manager.all_links.copy() if self.link_manager else [],
-            'issues': self.issue_detector.get_issues() if self.issue_detector else [],
+            'urls': urls_data,
+            'links': links_data,
+            'issues': issues_data,
+            'total_counts': {  # Add total counts so client knows the full dataset size
+                'urls': len(self.crawl_results),
+                'links': len(self.link_manager.all_links) if self.link_manager else 0,
+                'issues': len(all_issues)
+            },
+            'incremental': not full and last_url_index > 0,  # Flag to indicate incremental update
             'progress': min(100, (self.stats['crawled'] / max(link_stats['discovered'], 1)) * 100),
             'is_running_pagespeed': self.is_running_pagespeed,
             'memory': self.memory_monitor.get_stats(),

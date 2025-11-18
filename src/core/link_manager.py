@@ -12,12 +12,18 @@ class LinkManager:
         self.visited_urls = set()
         self.discovered_urls = deque()
         self.all_discovered_urls = set()
-        self.all_links = []
-        self.links_set = set()
-        self.source_pages = {}  # Maps target_url -> list of source_urls
+        # Optimized: use dict instead of list+set to reduce memory by ~50%
+        self.links_dict = {}  # link_key -> link_data (replaces all_links list and links_set)
+        self.source_pages = {}  # Maps target_url -> set of source_urls (optimized to use sets)
 
         self.urls_lock = threading.Lock()
         self.links_lock = threading.Lock()
+
+    @property
+    def all_links(self):
+        """Generate links list on-demand for backwards compatibility"""
+        with self.links_lock:
+            return list(self.links_dict.values())
 
     def extract_links(self, soup, current_url, depth, should_crawl_callback):
         """Extract links from HTML and add to discovery queue"""
@@ -39,11 +45,10 @@ class LinkManager:
 
             # Thread-safe checking and adding
             with self.urls_lock:
-                # Track source page for this URL
+                # Track source page for this URL (optimized to use set)
                 if clean_url not in self.source_pages:
-                    self.source_pages[clean_url] = []
-                if current_url not in self.source_pages[clean_url]:
-                    self.source_pages[clean_url].append(current_url)
+                    self.source_pages[clean_url] = set()
+                self.source_pages[clean_url].add(current_url)
 
                 if (clean_url not in self.visited_urls and
                     clean_url not in self.all_discovered_urls and
@@ -105,20 +110,18 @@ class LinkManager:
                     'placement': placement
                 }
 
-                # Track source page for this URL (for "Linked From" feature)
+                # Track source page for this URL (for "Linked From" feature) - optimized to use set
                 with self.urls_lock:
                     if clean_url not in self.source_pages:
-                        self.source_pages[clean_url] = []
-                    if source_url not in self.source_pages[clean_url]:
-                        self.source_pages[clean_url].append(source_url)
+                        self.source_pages[clean_url] = set()
+                    self.source_pages[clean_url].add(source_url)
 
-                # Thread-safe adding to links collection with duplicate checking
+                # Thread-safe adding to links collection - optimized to use dict
                 with self.links_lock:
                     link_key = f"{link_data['source_url']}|{link_data['target_url']}"
-
-                    if link_key not in self.links_set:
-                        self.links_set.add(link_key)
-                        self.all_links.append(link_data)
+                    # Dict automatically handles duplicates, no need for separate set
+                    if link_key not in self.links_dict:
+                        self.links_dict[link_key] = link_data
 
             except Exception:
                 continue
@@ -196,7 +199,8 @@ class LinkManager:
         status_lookup = {result['url']: result['status_code'] for result in crawl_results}
 
         with self.links_lock:
-            for link in self.all_links:
+            # Update each link's status in the dict
+            for link in self.links_dict.values():
                 target_url = link['target_url']
                 if target_url in status_lookup:
                     link['target_status'] = status_lookup[target_url]
@@ -204,7 +208,9 @@ class LinkManager:
     def get_source_pages(self, url):
         """Get list of source pages that link to this URL"""
         with self.urls_lock:
-            return self.source_pages.get(url, []).copy()
+            # Convert set to list for backwards compatibility
+            source_set = self.source_pages.get(url, set())
+            return list(source_set)
 
     def reset(self):
         """Reset all state"""
@@ -215,5 +221,4 @@ class LinkManager:
             self.source_pages.clear()
 
         with self.links_lock:
-            self.all_links.clear()
-            self.links_set.clear()
+            self.links_dict.clear()
