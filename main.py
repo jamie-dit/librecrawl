@@ -8,11 +8,16 @@ import webbrowser
 import argparse
 from io import StringIO
 from datetime import datetime, timedelta
-from flask import Flask, render_template, request, jsonify, session, redirect, url_for
+from flask import Flask, render_template, request, jsonify, session, redirect, url_for, Response, stream_with_context
 from functools import wraps
+from collections import defaultdict
+import psutil
+
 from src.crawler import WebCrawler
 from src.settings_manager import SettingsManager
 from src.auth_db import init_db, create_user, authenticate_user, get_user_by_id, log_guest_crawl, get_guest_crawls_last_24h
+from src.config import Config
+from src.logger import logger
 
 # Parse command line arguments
 parser = argparse.ArgumentParser(description='LibreCrawl - SEO Spider Tool')
@@ -22,18 +27,28 @@ args = parser.parse_args()
 
 LOCAL_MODE = args.local
 
+# Validate configuration
+Config.validate()
+
 app = Flask(__name__, template_folder='web/templates', static_folder='web/static')
-app.secret_key = 'librecrawl-secret-key-change-in-production'  # TODO: Use environment variable in production
+app.secret_key = Config.SECRET_KEY
 
 # Initialize database on startup
 init_db()
 
+# Log startup configuration
 if LOCAL_MODE:
-    print("=" * 60)
-    print("LOCAL MODE ENABLED")
-    print("All users will have admin tier access")
-    print("No rate limits or tier restrictions")
-    print("=" * 60)
+    logger.info("=" * 60)
+    logger.info("LOCAL MODE ENABLED")
+    logger.info("All users will have admin tier access")
+    logger.info("No rate limits or tier restrictions")
+    logger.info("=" * 60)
+else:
+    logger.info("LibreCrawl starting in standard mode")
+    logger.info(f"Configuration: {Config.display()}")
+
+# Rate limiting storage
+rate_limit_storage = defaultdict(lambda: {'minute': [], 'hour': []})
 
 def get_client_ip():
     """Get the real client IP address, checking Cloudflare headers first"""
@@ -48,6 +63,48 @@ def get_client_ip():
         return request.headers['X-Real-IP']
     # Fall back to direct connection IP
     return request.remote_addr
+
+def rate_limit_check(identifier):
+    """
+    Check if request is within rate limits
+    Returns (allowed: bool, message: str)
+    """
+    if not Config.ENABLE_RATE_LIMITING or LOCAL_MODE:
+        return True, ""
+
+    now = time.time()
+    limits = rate_limit_storage[identifier]
+
+    # Clean old entries
+    limits['minute'] = [t for t in limits['minute'] if now - t < 60]
+    limits['hour'] = [t for t in limits['hour'] if now - t < 3600]
+
+    # Check minute limit
+    if len(limits['minute']) >= Config.RATE_LIMIT_PER_MINUTE:
+        return False, f"Rate limit exceeded: {Config.RATE_LIMIT_PER_MINUTE} requests per minute"
+
+    # Check hour limit
+    if len(limits['hour']) >= Config.RATE_LIMIT_PER_HOUR:
+        return False, f"Rate limit exceeded: {Config.RATE_LIMIT_PER_HOUR} requests per hour"
+
+    # Record this request
+    limits['minute'].append(now)
+    limits['hour'].append(now)
+
+    return True, ""
+
+def rate_limited(f):
+    """Decorator to apply rate limiting to routes"""
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if Config.ENABLE_RATE_LIMITING and not LOCAL_MODE:
+            identifier = get_client_ip()
+            allowed, message = rate_limit_check(identifier)
+            if not allowed:
+                logger.warning(f"Rate limit exceeded for {identifier}: {request.path}")
+                return jsonify({'success': False, 'error': message}), 429
+        return f(*args, **kwargs)
+    return decorated_function
 
 def login_required(f):
     """Decorator to require login for routes"""
@@ -85,7 +142,7 @@ def get_or_create_crawler():
     with instances_lock:
         # Double-check pattern
         if session_id not in crawler_instances:
-            print(f"Creating new crawler instance for session: {session_id}, user: {user_id}, tier: {tier}")
+            logger.debug(f"Creating new crawler instance for session: {session_id}, user: {user_id}, tier: {tier}")
             crawler_instances[session_id] = {
                 'crawler': WebCrawler(),
                 'settings': SettingsManager(session_id=session_id, user_id=user_id, tier=tier),  # Per-user settings
@@ -118,7 +175,7 @@ def get_session_settings():
     with instances_lock:
         # Double-check pattern
         if session_id not in crawler_instances:
-            print(f"Creating new settings instance for session: {session_id}, user: {user_id}, tier: {tier}")
+            logger.debug(f"Creating new settings instance for session: {session_id}, user: {user_id}, tier: {tier}")
             crawler_instances[session_id] = {
                 'crawler': WebCrawler(),
                 'settings': SettingsManager(session_id=session_id, user_id=user_id, tier=tier),
@@ -131,8 +188,8 @@ def get_session_settings():
         return crawler_instances[session_id]['settings']
 
 def cleanup_old_instances():
-    """Remove crawler instances that haven't been accessed in 1 hour"""
-    timeout = timedelta(hours=1)
+    """Remove crawler instances that haven't been accessed based on configured timeout"""
+    timeout = timedelta(hours=Config.SESSION_TIMEOUT_HOURS)
     now = datetime.now()
 
     with instances_lock:
@@ -142,30 +199,30 @@ def cleanup_old_instances():
                 sessions_to_remove.append(session_id)
 
         for session_id in sessions_to_remove:
-            print(f"Cleaning up crawler instance for session: {session_id}")
+            logger.info(f"Cleaning up crawler instance for session: {session_id}")
             # Stop any running crawls
             try:
                 crawler_instances[session_id]['crawler'].stop_crawl()
-            except:
-                pass
+            except Exception as e:
+                logger.error(f"Error stopping crawl during cleanup: {e}")
             del crawler_instances[session_id]
 
         if sessions_to_remove:
-            print(f"Cleaned up {len(sessions_to_remove)} inactive crawler instances")
+            logger.info(f"Cleaned up {len(sessions_to_remove)} inactive crawler instances")
 
 def start_cleanup_thread():
     """Start background thread to cleanup old instances"""
     def cleanup_loop():
         while True:
-            time.sleep(300)  # Check every 5 minutes
+            time.sleep(Config.CLEANUP_INTERVAL_SECONDS)
             try:
                 cleanup_old_instances()
             except Exception as e:
-                print(f"Error in cleanup thread: {e}")
+                logger.error(f"Error in cleanup thread: {e}")
 
     cleanup_thread = threading.Thread(target=cleanup_loop, daemon=True)
     cleanup_thread.start()
-    print("Started crawler instance cleanup thread")
+    logger.info(f"Started crawler instance cleanup thread (interval: {Config.CLEANUP_INTERVAL_SECONDS}s)")
 
 def generate_csv_export(urls, fields):
     """Generate CSV export content"""
@@ -389,7 +446,7 @@ def register():
                 set_user_tier(user['id'], 'admin')
                 message = 'Account created and verified! You have admin access in local mode.'
         except Exception as e:
-            print(f"Error during local mode auto-verification: {e}")
+            logger.error(f"Error during local mode auto-verification: {e}")
             # Don't fail the registration, just log the error
             # The account is still created successfully
 
@@ -460,6 +517,59 @@ def user_info():
         }
     })
 
+@app.route('/health')
+def health_check():
+    """Health check endpoint for monitoring and load balancers"""
+    try:
+        # Get system stats
+        cpu_percent = psutil.cpu_percent(interval=0.1)
+        memory = psutil.virtual_memory()
+        disk = psutil.disk_usage('/')
+
+        # Get application stats
+        with instances_lock:
+            active_sessions = len(crawler_instances)
+            active_crawls = sum(1 for inst in crawler_instances.values()
+                               if inst['crawler'].is_running)
+
+        health_data = {
+            'status': 'healthy',
+            'timestamp': datetime.now().isoformat(),
+            'version': '2.0',
+            'system': {
+                'cpu_percent': cpu_percent,
+                'memory_percent': memory.percent,
+                'memory_available_gb': round(memory.available / (1024**3), 2),
+                'disk_percent': disk.percent,
+                'disk_free_gb': round(disk.free / (1024**3), 2)
+            },
+            'application': {
+                'active_sessions': active_sessions,
+                'active_crawls': active_crawls,
+                'local_mode': LOCAL_MODE,
+                'rate_limiting_enabled': Config.ENABLE_RATE_LIMITING
+            }
+        }
+
+        # Check if system is under stress
+        if memory.percent > 90 or disk.percent > 95:
+            health_data['status'] = 'degraded'
+            health_data['warnings'] = []
+            if memory.percent > 90:
+                health_data['warnings'].append(f'High memory usage: {memory.percent}%')
+            if disk.percent > 95:
+                health_data['warnings'].append(f'Low disk space: {disk.free / (1024**3):.1f}GB free')
+
+        return jsonify(health_data), 200 if health_data['status'] == 'healthy' else 503
+
+    except Exception as e:
+        logger.error(f"Health check failed: {e}")
+        return jsonify({
+            'status': 'unhealthy',
+            'error': str(e),
+            'timestamp': datetime.now().isoformat()
+        }), 500
+
 @app.route('/')
 @login_required
 def index():
@@ -508,7 +618,7 @@ def start_crawl():
         crawler_config = settings_manager.get_crawler_config()
         crawler.update_config(crawler_config)
     except Exception as e:
-        print(f"Warning: Could not apply settings: {e}")
+        logger.warning(f"Could not apply settings: {e}")
 
     success, message = crawler.start_crawl(url)
 
@@ -555,6 +665,133 @@ def crawl_status():
         status_data['issues'] = filtered_issues
 
     return jsonify(status_data)
+
+@app.route('/api/results_paginated')
+@login_required
+@rate_limited
+def results_paginated():
+    """Get paginated crawl results for efficient data transfer"""
+    crawler = get_or_create_crawler()
+
+    # Get pagination parameters
+    page = int(request.args.get('page', 1))
+    per_page = int(request.args.get('per_page', 100))
+    result_type = request.args.get('type', 'urls')  # urls, links, or issues
+
+    # Limit per_page to prevent abuse
+    per_page = min(per_page, 1000)
+
+    status_data = crawler.get_status(full=True)
+
+    if result_type == 'urls':
+        data = status_data.get('urls', [])
+    elif result_type == 'links':
+        data = status_data.get('links', [])
+    elif result_type == 'issues':
+        data = status_data.get('issues', [])
+    else:
+        return jsonify({'success': False, 'error': 'Invalid type parameter'}), 400
+
+    # Calculate pagination
+    total_items = len(data)
+    total_pages = (total_items + per_page - 1) // per_page
+    start_idx = (page - 1) * per_page
+    end_idx = start_idx + per_page
+
+    # Get page data
+    page_data = data[start_idx:end_idx]
+
+    return jsonify({
+        'success': True,
+        'data': page_data,
+        'pagination': {
+            'page': page,
+            'per_page': per_page,
+            'total_items': total_items,
+            'total_pages': total_pages,
+            'has_next': page < total_pages,
+            'has_prev': page > 1
+        }
+    })
+
+@app.route('/api/export_stream')
+@login_required
+@rate_limited
+def export_stream():
+    """Stream export data in chunks to reduce memory usage"""
+    crawler = get_or_create_crawler()
+    export_format = request.args.get('format', 'csv')
+    result_type = request.args.get('type', 'urls')
+
+    status_data = crawler.get_status(full=True)
+
+    if result_type == 'urls':
+        data = status_data.get('urls', [])
+        filename = f'librecrawl_urls_{int(time.time())}'
+    elif result_type == 'links':
+        data = status_data.get('links', [])
+        filename = f'librecrawl_links_{int(time.time())}'
+    elif result_type == 'issues':
+        data = status_data.get('issues', [])
+        filename = f'librecrawl_issues_{int(time.time())}'
+    else:
+        return jsonify({'success': False, 'error': 'Invalid type parameter'}), 400
+
+    def generate_csv():
+        """Generator function for streaming CSV"""
+        if not data:
+            yield ''
+            return
+
+        # Get all possible fields from first item
+        fields = list(data[0].keys()) if data else []
+
+        # Write header
+        output = StringIO()
+        writer = csv.DictWriter(output, fieldnames=fields)
+        writer.writeheader()
+        yield output.getvalue()
+
+        # Write rows in chunks
+        chunk_size = 100
+        for i in range(0, len(data), chunk_size):
+            chunk = data[i:i+chunk_size]
+            output = StringIO()
+            writer = csv.DictWriter(output, fieldnames=fields)
+            for row in chunk:
+                # Simplify complex types
+                simplified_row = {}
+                for key, value in row.items():
+                    if isinstance(value, (dict, list)):
+                        simplified_row[key] = str(value)
+                    else:
+                        simplified_row[key] = value
+                writer.writerow(simplified_row)
+            yield output.getvalue()
+
+    def generate_json():
+        """Generator function for streaming JSON"""
+        yield '{"data": ['
+        for i, item in enumerate(data):
+            if i > 0:
+                yield ','
+            yield json.dumps(item)
+        yield '], "count": ' + str(len(data)) + '}'
+
+    if export_format == 'csv':
+        return Response(
+            stream_with_context(generate_csv()),
+            mimetype='text/csv',
+            headers={'Content-Disposition': f'attachment; filename={filename}.csv'}
+        )
+    elif export_format == 'json':
+        return Response(
+            stream_with_context(generate_json()),
+            mimetype='application/json',
+            headers={'Content-Disposition': f'attachment; filename={filename}.json'}
+        )
+    else:
+        return jsonify({'success': False, 'error': 'Invalid format parameter'}), 400
 
 @app.route('/api/visualization_data')
 @login_required
@@ -642,7 +879,7 @@ def visualization_data():
         })
 
     except Exception as e:
-        print(f"Error generating visualization data: {e}")
+        logger.error(f"Error generating visualization data: {e}")
         import traceback
         traceback.print_exc()
         return jsonify({
@@ -843,7 +1080,7 @@ def export_data():
             exclusion_patterns_text = current_settings.get('issueExclusionPatterns', '')
             exclusion_patterns = [p.strip() for p in exclusion_patterns_text.split('\n') if p.strip()]
             issues = filter_issues_by_exclusion_patterns(issues, exclusion_patterns)
-            print(f"DEBUG: After exclusion filter, {len(issues)} issues remain")
+            logger.debug(f" After exclusion filter, {len(issues)} issues remain")
 
         # Collect files to export based on special field selections
         files_to_export = []
@@ -856,13 +1093,13 @@ def export_data():
         regular_fields = [f for f in export_fields if f not in ['issues_detected', 'links_detailed']]
 
         # Debug logging
-        print(f"DEBUG: export_fields = {export_fields}")
-        print(f"DEBUG: has_issues_export = {has_issues_export}")
-        print(f"DEBUG: has_links_export = {has_links_export}")
-        print(f"DEBUG: regular_fields = {regular_fields}")
-        print(f"DEBUG: len(urls) = {len(urls)}")
-        print(f"DEBUG: len(links) = {len(links)}")
-        print(f"DEBUG: len(issues) = {len(issues)}")
+        logger.debug(f" export_fields = {export_fields}")
+        logger.debug(f" has_issues_export = {has_issues_export}")
+        logger.debug(f" has_links_export = {has_links_export}")
+        logger.debug(f" regular_fields = {regular_fields}")
+        logger.debug(f" len(urls) = {len(urls)}")
+        logger.debug(f" len(links) = {len(links)}")
+        logger.debug(f" len(issues) = {len(issues)}")
 
         # Generate issues export if requested
         if has_issues_export:
@@ -962,16 +1199,16 @@ def main():
     # Start cleanup thread for old crawler instances
     start_cleanup_thread()
 
-    print("=" * 60)
+    logger.info("=" * 60)
     print("LibreCrawl - SEO Spider")
-    print("=" * 60)
+    logger.info("=" * 60)
     print(f"\n🚀 Server starting on http://0.0.0.0:5000")
     print(f"🌐 Access from browser: http://localhost:5000")
     print(f"📱 Access from network: http://<your-ip>:5000")
     print(f"\n✨ Multi-tenancy enabled - each browser session is isolated")
     print(f"💾 Settings stored in browser localStorage")
     print(f"\nPress Ctrl+C to stop the server\n")
-    print("=" * 60 + "\n")
+    logger.info("=" * 60 + "\n")
 
     # Open browser in a separate thread after short delay
     def open_browser():

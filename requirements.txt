@@ -6,3 +6,4 @@ playwright
 nest-asyncio==1.5.8
 psutil
 bcrypt==4.1.2
+python-dotenv==1.0.0
