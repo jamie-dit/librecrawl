@@ -12,6 +12,9 @@ from queue import Queue, Empty
 from functools import lru_cache
 import json
 
+# Import logger
+from src.logger import logger
+
 # Database file location
 DB_FILE = 'users.db'
 
@@ -140,7 +143,7 @@ def init_db():
         except:
             pass  # Column already exists
 
-        print("Database initialized successfully")
+        logger.info("Database initialized successfully")
 
 def hash_password(password):
     """Hash a password with bcrypt"""
@@ -288,7 +291,7 @@ def verify_user(user_id):
             cursor.execute('UPDATE users SET verified = 1 WHERE id = ?', (user_id,))
         return True, "User verified successfully"
     except Exception as e:
-        print(f"Error verifying user: {e}")
+        logger.error(f"Error verifying user: {e}")
         return False, str(e)
 
 def save_user_settings(user_id, settings_dict):
@@ -312,7 +315,7 @@ def save_user_settings(user_id, settings_dict):
 
         return True, "Settings saved successfully"
     except Exception as e:
-        print(f"Error saving user settings: {e}")
+        logger.error(f"Error saving user settings: {e}")
         return False, f"Failed to save settings: {str(e)}"
 
 def get_user_settings(user_id):
@@ -344,7 +347,7 @@ def get_user_settings(user_id):
                 return settings
             return None
     except Exception as e:
-        print(f"Error fetching user settings: {e}")
+        logger.error(f"Error fetching user settings: {e}")
         return None
 
 def delete_user_settings(user_id):
@@ -361,7 +364,7 @@ def delete_user_settings(user_id):
 
         return True
     except Exception as e:
-        print(f"Error deleting user settings: {e}")
+        logger.error(f"Error deleting user settings: {e}")
         return False
 
 def set_user_tier(user_id, tier):
@@ -492,5 +495,44 @@ def get_user_crawl_history(user_id, limit=50):
             ''', (user_id, limit))
             return [dict(row) for row in cursor.fetchall()]
     except Exception as e:
-        print(f"Error getting crawl history: {e}")
+        logger.error(f"Error getting crawl history: {e}")
         return []
+
+def cleanup_old_data(guest_crawl_days=30, crawl_history_days=90):
+    """
+    Clean up old data from database to prevent bloat
+
+    Args:
+        guest_crawl_days: Delete guest crawls older than this many days
+        crawl_history_days: Delete completed crawl history older than this many days
+
+    Returns:
+        (guest_deleted, history_deleted): Count of deleted records
+    """
+    try:
+        with get_db() as conn:
+            cursor = conn.cursor()
+
+            # Delete old guest crawls
+            cursor.execute('''
+                DELETE FROM guest_crawls
+                WHERE crawl_time < datetime('now', '-' || ? || ' days')
+            ''', (guest_crawl_days,))
+            guest_deleted = cursor.rowcount
+
+            # Delete old completed crawl history
+            cursor.execute('''
+                DELETE FROM crawl_history
+                WHERE status = 'completed'
+                AND completed_at < datetime('now', '-' || ? || ' days')
+            ''', (crawl_history_days,))
+            history_deleted = cursor.rowcount
+
+            if guest_deleted > 0 or history_deleted > 0:
+                logger.info(f"Data cleanup: Deleted {guest_deleted} guest crawls and {history_deleted} crawl history records")
+
+            return guest_deleted, history_deleted
+
+    except Exception as e:
+        logger.error(f"Error during data cleanup: {e}")
+        return 0, 0

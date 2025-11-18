@@ -6,6 +6,8 @@ import xml.etree.ElementTree as ET
 import uuid
 import webbrowser
 import argparse
+import signal
+import sys
 from io import StringIO
 from datetime import datetime, timedelta
 from flask import Flask, render_template, request, jsonify, session, redirect, url_for, Response, stream_with_context
@@ -211,18 +213,28 @@ def cleanup_old_instances():
             logger.info(f"Cleaned up {len(sessions_to_remove)} inactive crawler instances")
 
 def start_cleanup_thread():
-    """Start background thread to cleanup old instances"""
+    """Start background thread to cleanup old instances and database data"""
+    from src.auth_db import cleanup_old_data
+
     def cleanup_loop():
+        iteration = 0
         while True:
             time.sleep(Config.CLEANUP_INTERVAL_SECONDS)
             try:
+                # Clean up old crawler instances
                 cleanup_old_instances()
+
+                # Clean up old database data (run every 10 iterations, ~50 minutes with 5min interval)
+                iteration += 1
+                if iteration % 10 == 0:
+                    cleanup_old_data(guest_crawl_days=30, crawl_history_days=90)
+
             except Exception as e:
                 logger.error(f"Error in cleanup thread: {e}")
 
     cleanup_thread = threading.Thread(target=cleanup_loop, daemon=True)
     cleanup_thread.start()
-    logger.info(f"Started crawler instance cleanup thread (interval: {Config.CLEANUP_INTERVAL_SECONDS}s)")
+    logger.info(f"Started background cleanup thread (interval: {Config.CLEANUP_INTERVAL_SECONDS}s)")
 
 def generate_csv_export(urls, fields):
     """Generate CSV export content"""
@@ -585,12 +597,19 @@ def debug_memory_page():
 @login_required
 def start_crawl():
     from src.auth_db import get_crawls_last_24h, log_crawl_start
+    from src.url_validator import is_valid_url, sanitize_url
 
     data = request.get_json()
     url = data.get('url')
 
     if not url:
         return jsonify({'success': False, 'error': 'URL is required'})
+
+    # Sanitize and validate URL
+    url = sanitize_url(url)
+    is_valid, error_msg = is_valid_url(url)
+    if not is_valid:
+        return jsonify({'success': False, 'error': f'Invalid URL: {error_msg}'})
 
     user_id = session.get('user_id')
     tier = session.get('tier', 'guest')
@@ -792,6 +811,111 @@ def export_stream():
         )
     else:
         return jsonify({'success': False, 'error': 'Invalid format parameter'}), 400
+
+@app.route('/api/broken_links')
+@login_required
+@rate_limited
+def broken_links():
+    """Get all broken links (4xx, 5xx status codes)"""
+    crawler = get_or_create_crawler()
+    status_data = crawler.get_status(full=True)
+
+    urls = status_data.get('urls', [])
+    links = status_data.get('links', [])
+
+    # Build lookup for broken URLs
+    broken_urls = {url['url']: url['status_code']
+                   for url in urls
+                   if url.get('status_code', 0) >= 400}
+
+    # Find links pointing to broken URLs
+    broken_links = []
+    for link in links:
+        target_url = link.get('target_url')
+        if target_url in broken_urls:
+            broken_links.append({
+                'source_url': link.get('source_url'),
+                'target_url': target_url,
+                'anchor_text': link.get('anchor_text', ''),
+                'status_code': broken_urls[target_url],
+                'is_internal': link.get('is_internal', False)
+            })
+
+    # Group by status code
+    by_status_code = {}
+    for link in broken_links:
+        status = link['status_code']
+        if status not in by_status_code:
+            by_status_code[status] = []
+        by_status_code[status].append(link)
+
+    return jsonify({
+        'success': True,
+        'broken_links': broken_links,
+        'by_status_code': by_status_code,
+        'total_broken': len(broken_links),
+        'summary': {
+            str(code): len(links_list)
+            for code, links_list in by_status_code.items()
+        }
+    })
+
+@app.route('/api/sitemap')
+@login_required
+@rate_limited
+def generate_sitemap():
+    """Generate sitemap.xml from crawled URLs"""
+    crawler = get_or_create_crawler()
+    status_data = crawler.get_status(full=True)
+
+    urls = status_data.get('urls', [])
+
+    # Filter to only successful URLs (2xx status codes)
+    successful_urls = [url for url in urls if 200 <= url.get('status_code', 0) < 300]
+
+    # Build sitemap XML
+    root = ET.Element('urlset')
+    root.set('xmlns', 'http://www.sitemaps.org/schemas/sitemap/0.9')
+
+    for url_data in successful_urls:
+        url_elem = ET.SubElement(root, 'url')
+
+        # Location (required)
+        loc = ET.SubElement(url_elem, 'loc')
+        loc.text = url_data.get('url', '')
+
+        # Last modified (use current time as approximation)
+        lastmod = ET.SubElement(url_elem, 'lastmod')
+        lastmod.text = datetime.now().strftime('%Y-%m-%d')
+
+        # Change frequency (estimate based on page type)
+        changefreq = ET.SubElement(url_elem, 'changefreq')
+        url_path = url_data.get('url', '').lower()
+        if url_path.endswith('/') or url_path.endswith('/index.html'):
+            changefreq.text = 'weekly'  # Homepage/index
+        elif '/blog/' in url_path or '/news/' in url_path:
+            changefreq.text = 'daily'  # Blog/news
+        else:
+            changefreq.text = 'monthly'  # Regular pages
+
+        # Priority (based on depth/importance)
+        priority = ET.SubElement(url_elem, 'priority')
+        if url_path.endswith('/') or url_path.endswith('/index.html'):
+            priority.text = '1.0'  # Homepage
+        else:
+            priority.text = '0.8'  # Other pages
+
+    # Generate XML string
+    xml_string = ET.tostring(root, encoding='unicode', method='xml')
+
+    # Pretty print with declaration
+    xml_output = '<?xml version="1.0" encoding="UTF-8"?>\n' + xml_string
+
+    return Response(
+        xml_output,
+        mimetype='application/xml',
+        headers={'Content-Disposition': 'attachment; filename=sitemap.xml'}
+    )
 
 @app.route('/api/visualization_data')
 @login_required
@@ -1195,7 +1319,27 @@ def export_data():
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)})
 
+def graceful_shutdown(signum, frame):
+    """Handle graceful shutdown on SIGTERM/SIGINT"""
+    logger.info(f"Received signal {signum}, initiating graceful shutdown...")
+
+    # Stop all active crawls
+    with instances_lock:
+        for session_id, instance_data in list(crawler_instances.items()):
+            try:
+                logger.info(f"Stopping crawl for session: {session_id}")
+                instance_data['crawler'].stop_crawl()
+            except Exception as e:
+                logger.error(f"Error stopping crawl for {session_id}: {e}")
+
+    logger.info("All crawls stopped. Exiting...")
+    sys.exit(0)
+
 def main():
+    # Register signal handlers for graceful shutdown
+    signal.signal(signal.SIGTERM, graceful_shutdown)
+    signal.signal(signal.SIGINT, graceful_shutdown)
+
     # Start cleanup thread for old crawler instances
     start_cleanup_thread()
 

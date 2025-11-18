@@ -40,6 +40,10 @@ LibreCrawl crawls websites and gives you detailed information about pages, links
 - 🔐 **Secure secrets** - Store sensitive config in environment variables
 - 🚦 **Rate limiting** - Configurable per-minute and per-hour limits
 - ⏱️ **Configurable timeouts** - Adjust session timeout based on needs
+- 🧹 **Background data cleanup** - Automatic purging of old crawl data
+- 🛡️ **URL validation** - SSRF protection and sanitization
+- 🔄 **Graceful shutdown** - Properly stop crawls on SIGTERM/SIGINT
+- ⚡ **Thread-safe queues** - Optimized URL queue using queue.Queue
 
 ## Getting started
 
@@ -143,7 +147,9 @@ LibreCrawl provides several API endpoints for programmatic access:
 - `GET /api/crawl_status` - Get current crawl status with incremental updates
 - `GET /api/results_paginated` - Fetch paginated results (urls, links, or issues)
 - `GET /api/export_stream` - Stream export data in chunks (CSV or JSON)
-- `POST /api/start_crawl` - Start a new crawl
+- `GET /api/broken_links` - Get all broken links (4xx, 5xx) with source pages
+- `GET /api/sitemap` - Generate sitemap.xml from crawled URLs
+- `POST /api/start_crawl` - Start a new crawl (with URL validation)
 - `POST /api/stop_crawl` - Stop the current crawl
 
 ### Pagination Parameters
@@ -168,6 +174,30 @@ curl "http://localhost:5000/api/export_stream?format=csv&type=urls"
 curl "http://localhost:5000/api/export_stream?format=json&type=links"
 ```
 
+### Broken Links Report
+Get detailed broken link analysis:
+```bash
+# Get all broken links with source pages and status codes
+curl "http://localhost:5000/api/broken_links"
+```
+
+Returns:
+- All broken links grouped by status code
+- Source pages for each broken link
+- Summary statistics
+
+### Sitemap Generation
+Generate standards-compliant sitemap.xml:
+```bash
+# Download sitemap.xml
+curl "http://localhost:5000/api/sitemap" > sitemap.xml
+```
+
+Features:
+- Includes only successful URLs (2xx status codes)
+- Automatic priority and changefreq estimation
+- Ready for search engine submission
+
 ## Known limitations
 
 - PageSpeed API has rate limits (works better with API key)
@@ -183,6 +213,7 @@ curl "http://localhost:5000/api/export_stream?format=json&type=links"
 - `src/config.py` - Environment configuration loader
 - `src/logger.py` - Centralized logging setup
 - `src/auth_db.py` - Database operations with connection pooling
+- `src/url_validator.py` - URL validation and SSRF protection
 - `src/core/` - Core modules (link management, SEO extraction, etc.)
 - `web/` - Frontend interface files
 - `.env.example` - Example environment configuration

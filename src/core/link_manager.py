@@ -1,7 +1,7 @@
 """Link management and extraction"""
 import threading
 from urllib.parse import urljoin, urlparse
-from collections import deque
+from queue import Queue
 
 
 class LinkManager:
@@ -10,7 +10,7 @@ class LinkManager:
     def __init__(self, base_domain):
         self.base_domain = base_domain
         self.visited_urls = set()
-        self.discovered_urls = deque()
+        self.discovered_urls = Queue()  # Thread-safe queue instead of deque
         self.all_discovered_urls = set()
         # Optimized: use dict instead of list+set to reduce memory by ~50%
         self.links_dict = {}  # link_key -> link_data (replaces all_links list and links_set)
@@ -57,7 +57,7 @@ class LinkManager:
                     # Check if this URL should be crawled
                     if should_crawl_callback(clean_url):
                         self.all_discovered_urls.add(clean_url)
-                        self.discovered_urls.append((clean_url, depth))
+                        self.discovered_urls.put((clean_url, depth))
 
     def collect_all_links(self, soup, source_url, crawl_results):
         """Collect all links for the Links tab display"""
@@ -170,7 +170,7 @@ class LinkManager:
         with self.urls_lock:
             if url not in self.all_discovered_urls and url not in self.visited_urls:
                 self.all_discovered_urls.add(url)
-                self.discovered_urls.append((url, depth))
+                self.discovered_urls.put((url, depth))
 
     def mark_visited(self, url):
         """Mark a URL as visited"""
@@ -178,11 +178,12 @@ class LinkManager:
             self.visited_urls.add(url)
 
     def get_next_url(self):
-        """Get the next URL to crawl"""
-        with self.urls_lock:
-            if self.discovered_urls:
-                return self.discovered_urls.popleft()
-        return None
+        """Get the next URL to crawl (non-blocking)"""
+        try:
+            # Use get_nowait() for non-blocking retrieval
+            return self.discovered_urls.get_nowait()
+        except:
+            return None
 
     def get_stats(self):
         """Get current statistics"""
@@ -190,7 +191,7 @@ class LinkManager:
             return {
                 'discovered': len(self.all_discovered_urls),
                 'visited': len(self.visited_urls),
-                'pending': len(self.discovered_urls)
+                'pending': self.discovered_urls.qsize()
             }
 
     def update_link_statuses(self, crawl_results):
@@ -216,7 +217,8 @@ class LinkManager:
         """Reset all state"""
         with self.urls_lock:
             self.visited_urls.clear()
-            self.discovered_urls.clear()
+            # Clear queue by creating a new one
+            self.discovered_urls = Queue()
             self.all_discovered_urls.clear()
             self.source_pages.clear()
 
